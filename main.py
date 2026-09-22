@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""Compatibility entry point: exposes the FastAPI app at module root."""
 
-app = FastAPI()
+from canary.api import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
