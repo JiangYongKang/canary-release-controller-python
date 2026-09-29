@@ -15,7 +15,6 @@ from canary.policy import (
     DEFAULT_FAILURE_RATE_THRESHOLD,
     DEFAULT_MIN_REQUESTS,
     DEFAULT_OBSERVE_MINUTES,
-    DEFAULT_STEPS,
     PolicyRegistry,
     PromotionPolicy,
 )
@@ -30,22 +29,16 @@ class CanaryService:
         clock: Callable[[], str] | None = None,
     ) -> None:
         self.store = LocalStore(persist_path=persist_path)
-        self.policies = PolicyRegistry(clock=clock)
+        self.policies = PolicyRegistry(self.store, clock=clock)
         kwargs = {}
         if clock is not None:
             kwargs["clock"] = clock
         self.engine = CanaryEngine(self.store, self.policies, **kwargs)
-        self._seed_default_policy()
-
-    def _seed_default_policy(self) -> None:
-        if not self.policies.all_versions():
-            self.policies.create(
-                "default",
-                list(DEFAULT_STEPS),
-                failure_rate_threshold=DEFAULT_FAILURE_RATE_THRESHOLD,
-                min_requests=DEFAULT_MIN_REQUESTS,
-                observe_minutes=DEFAULT_OBSERVE_MINUTES,
-            )
+        # Safe to run on every startup / in every process: the store-level
+        # transaction makes the "insert v1 if missing" check atomic across
+        # processes, and it also restores v1 when opening a legacy state file
+        # written before policies were persisted.
+        self.policies.ensure_default()
 
     def create_policy(
         self,

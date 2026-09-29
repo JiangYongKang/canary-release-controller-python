@@ -21,11 +21,14 @@ same stored record re-evaluated at any time yields the same conclusion:
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from canary.errors import InvalidPolicyError, PolicyNotFoundError
 from canary.models import CanaryStep
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
+    from canary.store import LocalStore
 
 # Stable defaults used when legacy records are missing fields.
 DEFAULT_FAILURE_RATE_THRESHOLD = 0.05
@@ -166,11 +169,20 @@ class PromotionPolicy:
 
 
 class PolicyRegistry:
-    """In-memory versioned, immutable policy store."""
+    """Versioned, immutable policy set backed by the (cross-process) store.
 
-    def __init__(self, clock=None) -> None:
-        self._versions: dict[int, PromotionPolicy] = {}
-        self._lock = threading.RLock()
+    Policies live in the same shared state file as releases, so processes that
+    attach later see every version created elsewhere, and a release registered
+    with a custom policy can keep evaluating against that exact policy after a
+    restart.  Each read/create runs inside one store transaction.
+    """
+
+    def __init__(
+        self,
+        store: "LocalStore",
+        clock=None,
+    ) -> None:
+        self._store = store
         self._clock = clock
 
     def create(
@@ -185,32 +197,35 @@ class PolicyRegistry:
         """Create a new immutable version.
 
         ``steps`` may be bare percents (all sharing ``observe_minutes``) or
-        pre-built :class:`CanaryStep` objects.
+        pre-built :class:`CanaryStep` objects.  Version allocation and insert
+        happen as one atomic transaction, so concurrent creators in different
+        processes never collide on the same version number.
         """
-        with self._lock:
-            coerced = [_coerce_step(s) for s in steps]
-            # Bare-int form uses the call-level observe_minutes for all steps.
-            if steps and all(not isinstance(s, CanaryStep) for s in steps):
-                coerced = [
-                    CanaryStep(s.new_version_percent, observe_minutes) for s in coerced
-                ]
-            validate_steps(coerced)
-            if not (0.0 <= failure_rate_threshold <= 1.0):
-                raise InvalidPolicyError(
-                    "invalid_policy",
-                    details={"field": "failure_rate_threshold", "problem": "out of [0,1]"},
-                )
-            if min_requests < 0:
-                raise InvalidPolicyError(
-                    "invalid_policy",
-                    details={"field": "min_requests", "problem": "must be >= 0"},
-                )
-            if observe_minutes < 1:
-                raise InvalidPolicyError(
-                    "invalid_policy",
-                    details={"field": "observe_minutes", "problem": "must be >= 1"},
-                )
-            version = (max(self._versions) + 1) if self._versions else 1
+        coerced = [_coerce_step(s) for s in steps]
+        # Bare-int form uses the call-level observe_minutes for all steps.
+        if steps and all(not isinstance(s, CanaryStep) for s in steps):
+            coerced = [
+                CanaryStep(s.new_version_percent, observe_minutes) for s in coerced
+            ]
+        validate_steps(coerced)
+        if not (0.0 <= failure_rate_threshold <= 1.0):
+            raise InvalidPolicyError(
+                "invalid_policy",
+                details={"field": "failure_rate_threshold", "problem": "out of [0,1]"},
+            )
+        if min_requests < 0:
+            raise InvalidPolicyError(
+                "invalid_policy",
+                details={"field": "min_requests", "problem": "must be >= 0"},
+            )
+        if observe_minutes < 1:
+            raise InvalidPolicyError(
+                "invalid_policy",
+                details={"field": "observe_minutes", "problem": "must be >= 1"},
+            )
+        with self._store.lock():
+            existing = self._store.all_policies()
+            version = (max(int(p["version"]) for p in existing) + 1) if existing else 1
             policy = PromotionPolicy(
                 version=version,
                 name=name,
@@ -219,26 +234,46 @@ class PolicyRegistry:
                 min_requests=int(min_requests),
                 created_at=self._clock() if self._clock else "",
             )
-            self._versions[version] = policy
+            self._store.put_policy(policy.to_dict())
             return policy
 
     def get(self, version: int) -> PromotionPolicy:
-        with self._lock:
-            try:
-                return self._versions[version]
-            except KeyError:
-                raise PolicyNotFoundError(
-                    "policy_not_found", details={"version": version}
-                ) from None
+        raw = self._store.get_policy(version)
+        if raw is None:
+            raise PolicyNotFoundError(
+                "policy_not_found", details={"version": version}
+            )
+        return PromotionPolicy.from_dict(raw)
 
     def latest(self) -> PromotionPolicy:
-        with self._lock:
-            if not self._versions:
-                raise PolicyNotFoundError(
-                    "policy_not_found", details={"version": "latest"}
-                )
-            return self._versions[max(self._versions)]
+        versions = self._store.all_policies()
+        if not versions:
+            raise PolicyNotFoundError(
+                "policy_not_found", details={"version": "latest"}
+            )
+        return PromotionPolicy.from_dict(versions[-1])
 
     def all_versions(self) -> list[PromotionPolicy]:
-        with self._lock:
-            return [self._versions[v] for v in sorted(self._versions)]
+        return [PromotionPolicy.from_dict(p) for p in self._store.all_policies()]
+
+    def ensure_default(self) -> None:
+        """Atomically seed default policy v1 if no policy exists.
+
+        Safe to call from every process on startup: under the cross-process
+        lock at most one process performs the insert.
+        """
+        with self._store.lock():
+            if self._store.all_policies():
+                return
+            policy = PromotionPolicy(
+                version=1,
+                name=DEFAULT_POLICY_NAME,
+                steps=tuple(
+                    CanaryStep(percent, DEFAULT_OBSERVE_MINUTES)
+                    for percent in DEFAULT_STEPS
+                ),
+                failure_rate_threshold=DEFAULT_FAILURE_RATE_THRESHOLD,
+                min_requests=DEFAULT_MIN_REQUESTS,
+                created_at="",
+            )
+            self._store.put_policy(policy.to_dict())

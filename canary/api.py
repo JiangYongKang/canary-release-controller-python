@@ -14,6 +14,7 @@ rejection reason remains distinguishable across entry points:
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 
 from fastapi import FastAPI, Request
@@ -100,7 +101,12 @@ def _release_view(r) -> dict:
 
 def create_app(service: CanaryService | None = None) -> FastAPI:
     app = FastAPI(title="canary-release-controller")
-    app.state.service = service or CanaryService()
+    # A resident service and CLI/background scripts share state by pointing at
+    # the same file: export CANARY_STATE_PATH (CLI defaults to the same env var).
+    if service is None:
+        state_path = os.environ.get("CANARY_STATE_PATH")
+        service = CanaryService(persist_path=state_path) if state_path else CanaryService()
+    app.state.service = service
 
     @app.exception_handler(CanaryError)
     async def handle_canary_error(_: Request, exc: CanaryError):

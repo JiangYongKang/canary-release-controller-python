@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
+
+# Allow ``python scripts/demo.py`` from any working directory without an install.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient
 
