@@ -30,7 +30,7 @@ class CanaryService:
         clock: Callable[[], str] | None = None,
     ) -> None:
         self.store = LocalStore(persist_path=persist_path)
-        self.policies = PolicyRegistry(clock=clock)
+        self.policies = PolicyRegistry(self.store, clock=clock)
         kwargs = {}
         if clock is not None:
             kwargs["clock"] = clock

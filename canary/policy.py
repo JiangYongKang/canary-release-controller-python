@@ -21,11 +21,14 @@ same stored record re-evaluated at any time yields the same conclusion:
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from canary.errors import InvalidPolicyError, PolicyNotFoundError
 from canary.models import CanaryStep
+
+if TYPE_CHECKING:
+    from canary.store import LocalStore
 
 # Stable defaults used when legacy records are missing fields.
 DEFAULT_FAILURE_RATE_THRESHOLD = 0.05
@@ -166,11 +169,22 @@ class PromotionPolicy:
 
 
 class PolicyRegistry:
-    """In-memory versioned, immutable policy store."""
+    """Versioned, immutable policy store backed by the shared LocalStore.
 
-    def __init__(self, clock=None) -> None:
-        self._versions: dict[int, PromotionPolicy] = {}
-        self._lock = threading.RLock()
+    Policy versions live in the same durable state file (and the same
+    cross-process transactions) as releases, so a non-default policy created
+    by one entry point is visible to every other entry point and survives
+    process/machine restarts.  With an in-memory :class:`LocalStore` the
+    behaviour is identical to the previous process-local registry.
+    """
+
+    def __init__(self, store: LocalStore | None = None, clock=None) -> None:
+        if store is None:
+            # Local import: canary.store imports PromotionPolicy at module load.
+            from canary.store import LocalStore
+
+            store = LocalStore()
+        self._store = store
         self._clock = clock
 
     def create(
@@ -187,7 +201,8 @@ class PolicyRegistry:
         ``steps`` may be bare percents (all sharing ``observe_minutes``) or
         pre-built :class:`CanaryStep` objects.
         """
-        with self._lock:
+        with self._store.transaction():
+            existing = self._store.all_policy_dicts()
             coerced = [_coerce_step(s) for s in steps]
             # Bare-int form uses the call-level observe_minutes for all steps.
             if steps and all(not isinstance(s, CanaryStep) for s in steps):
@@ -210,7 +225,7 @@ class PolicyRegistry:
                     "invalid_policy",
                     details={"field": "observe_minutes", "problem": "must be >= 1"},
                 )
-            version = (max(self._versions) + 1) if self._versions else 1
+            version = (max(int(p["version"]) for p in existing) + 1) if existing else 1
             policy = PromotionPolicy(
                 version=version,
                 name=name,
@@ -219,26 +234,24 @@ class PolicyRegistry:
                 min_requests=int(min_requests),
                 created_at=self._clock() if self._clock else "",
             )
-            self._versions[version] = policy
+            self._store.put_policy(policy)
             return policy
 
     def get(self, version: int) -> PromotionPolicy:
-        with self._lock:
-            try:
-                return self._versions[version]
-            except KeyError:
-                raise PolicyNotFoundError(
-                    "policy_not_found", details={"version": version}
-                ) from None
+        raw = self._store.get_policy_dict(version)
+        if raw is None:
+            raise PolicyNotFoundError(
+                "policy_not_found", details={"version": version}
+            )
+        return PromotionPolicy.from_dict(raw)
 
     def latest(self) -> PromotionPolicy:
-        with self._lock:
-            if not self._versions:
-                raise PolicyNotFoundError(
-                    "policy_not_found", details={"version": "latest"}
-                )
-            return self._versions[max(self._versions)]
+        versions = self._store.all_policy_dicts()
+        if not versions:
+            raise PolicyNotFoundError(
+                "policy_not_found", details={"version": "latest"}
+            )
+        return PromotionPolicy.from_dict(versions[-1])
 
     def all_versions(self) -> list[PromotionPolicy]:
-        with self._lock:
-            return [self._versions[v] for v in sorted(self._versions)]
+        return [PromotionPolicy.from_dict(p) for p in self._store.all_policy_dicts()]
