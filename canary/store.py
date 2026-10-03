@@ -329,6 +329,7 @@ def _release_to_dict(r: Release) -> dict:
 
 def _release_from_dict(raw: dict) -> Release:
     from canary.models import CanaryStep
+    from canary.policy import DEFAULT_POLICY_VERSION
 
     return Release(
         release_id=raw["release_id"],
@@ -337,7 +338,9 @@ def _release_from_dict(raw: dict) -> Release:
         old_version=raw["old_version"],
         new_version=raw["new_version"],
         status=ReleaseStatus(raw["status"]),
-        policy_version=raw["policy_version"],
+        # Legacy writers did not record the bound policy version; fall back to
+        # the fixed default so one old record can never crash the whole load.
+        policy_version=int(raw.get("policy_version", DEFAULT_POLICY_VERSION)),
         steps=[
             CanaryStep(
                 new_version_percent=s["new_version_percent"],

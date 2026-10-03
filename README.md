@@ -18,7 +18,8 @@ canary/
   service.py  # 应用门面（HTTP / CLI / 测试共用同一入口）
   api.py      # FastAPI HTTP 入口（支持 CANARY_STATE_PATH 共享状态文件）
   cli.py      # 命令行入口（python -m canary.cli，独立进程操作同一状态文件）
-tests/        # 43 个单测：状态机、阈值边界、并发幂等、策略历史、HTTP、多进程、重启续跑
+tests/        # 50 个单测：状态机、阈值边界、并发幂等、策略历史、HTTP、多进程、
+              # 重启续跑、旧格式兼容（缺字段 / 悬空策略引用 / 反复重启重评估）
 scripts/demo.py  # 本地端到端演示
 ```
 
@@ -97,6 +98,10 @@ scripts/demo.py  # 本地端到端演示
   - 缺 `min_requests` → `100`
   - 步长为裸整数 `[10,100]` → 每步 `observe_minutes=5`
   - 缺 `steps` → `[10,30,50,100]`；缺 `name` → `"default"`
+  - 发布记录缺 `policy_version` → `1`
+  - 发布绑定的策略版本在文件中根本没有定义 → 判定/推进/写历史时回退到
+    同一组固定缺省参数（阈值 0.05、样本 100、步长 `[10,30,50,100]`、每步 5 分钟），
+    历史快照仍记录发布当初绑定的版本号
 - `PromotionPolicy.from_dict(snapshot).to_dict()` 幂等且确定性：
   **相同输入 + 相同策略重复评估必得到相同结论**。
 
@@ -162,9 +167,19 @@ scripts/demo.py  # 本地端到端演示
   - 老文件没有 `policies` 段时，打开即透明补回默认策略 v1（固定默认
     阈值 0.05 / 样本 100 / 步长 `[10,30,50,100]` / 每步 5 分钟），
     引用 v1 的老发布可直接继续；
+  - 发布记录缺 `policy_version` 字段 → 按固定缺省 `1` 加载，
+    **一条缺字段的老记录不会让整个状态文件打不开**，同文件里的其它发布、
+    幂等台账、历史记录都照常可用；
+  - 发布绑定的策略版本在文件里没有定义（老文件没把策略定义留下来）→
+    判定、推进、回滚、写历史都回退到同一组固定缺省参数
+    （阈值 0.05 / 样本 100 / 每步观察时长取发布自己记录的步长），
+    不会一打开就失败卡住；历史快照里仍记录当初绑定的版本号；
   - 步长缺 `observe_minutes` → 5；发布/历史记录缺
     `created_at` / `updated_at` / `finish_reason` / `reason` /
     `policy_snapshot` / `finished_at` → 空字符串或空对象，语义与第 3 节一致。
+  - 以上缺省全部来自固定常量：同一份旧记录无论重启多少次、在哪个进程里、
+    重复评估多少遍，拿到的阈值、样本量要求和观察时长完全一样；
+    已结束发布的结论与历史不会被改写，也不会多写一条。
 - 兼容范围说明：状态文件面向**同一台机器、可信本地进程**之间共享（Unix `flock`，
   Linux/macOS 可用）；不面向网络文件系统上的多机协作。不给 `persist_path` 时
   退化为纯内存模式（单进程，不落盘）。
@@ -219,12 +234,14 @@ uv run uvicorn main:app --reload
 # 安装依赖
 uv sync --group dev
 
-# 全量单测（43 个）：除原有场景外，新增真正起独立 OS 进程的多进程共享、
+# 全量单测（50 个）：除原有场景外，新增真正起独立 OS 进程的多进程共享、
 # 跨进程并发推进/回滚、跨重启续跑（含自定义策略）、终态不可变、旧格式缺省、
+# 旧格式兼容（缺 policy_version 字段、引用未定义策略、反复重启重评估）、
 # 原子落盘与进程被杀等用例
 uv run pytest -s          # -s 可看到输入、状态迁移与判定依据日志
 uv run pytest             # 简洁模式
-uv run pytest tests/test_multiprocess.py tests/test_restart.py  # 只跑新场景
+uv run pytest tests/test_multiprocess.py tests/test_restart.py  # 只跑多进程/重启场景
+uv run pytest tests/test_legacy_compat.py -s   # 只跑旧格式兼容（日志含 AREA/CASE/RESULT）
 
 # 端到端演示（走真实 HTTP 调用，含健康完成 + 边界自动回滚 + 幂等 + 历史）
 uv run python scripts/demo.py
@@ -296,4 +313,57 @@ rm -rf "$D"
 预期：`list-policies` 能看到 v1+v2；重启后的 `evaluate` 仍按 **3 分钟 / 250 样本 /
 阈值 0.30** 判定；`after-restart` 推进到 60%，其重放结论不变；16 个并发回滚后
 `history entries: 1`。
+
+### 一键验证旧格式状态文件兼容（无需任何前置设置）
+
+下面整段复制到终端即可运行：先手写一份"老版本留下的"状态文件
+（发布记录缺 `policy_version` 字段、还引用了一个从未持久化过的策略版本 9），
+再用新版 CLI 直接打开、判定、推进。
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+D=$(mktemp -d); STATE="$D/legacy-state.json"
+CLI="uv run python -m canary.cli --state $STATE"
+
+# 1) 伪造一份旧格式文件：rel-legacy 缺 policy_version；rel-orphan 绑定未定义的 v9
+cat > "$STATE" <<'JSON'
+{
+  "releases": [
+    {"release_id": "rel-legacy", "service": "legacy-svc", "environment": "prod",
+     "old_version": "v1", "new_version": "v2", "status": "canary",
+     "steps": [{"new_version_percent": 100, "observe_minutes": 1}],
+     "current_step_index": 0},
+    {"release_id": "rel-orphan", "service": "orphan-svc", "environment": "prod",
+     "old_version": "v1", "new_version": "v2", "status": "canary",
+     "policy_version": 9,
+     "steps": [{"new_version_percent": 100, "observe_minutes": 1}],
+     "current_step_index": 0}
+  ],
+  "decisions": [], "history": []
+}
+JSON
+
+# 2) 新版 CLI 打开不崩：缺字段记录按缺省 policy_version=1 加载
+$CLI status rel-legacy          # policy_version=1, status=canary
+
+# 3) 缺字段记录按固定缺省（阈值 0.05 / 样本 100 / 每步时长取记录里的步长）继续走
+$CLI observe rel-legacy --step 0 --minute 0 --total 100 --failed 0
+$CLI promote rel-legacy --request-id finish   # -> to_status=completed
+
+# 4) 引用未定义策略 v9 的发布同样能判定推进（回退到同一组固定缺省参数）
+$CLI observe rel-orphan --step 0 --minute 0 --total 100 --failed 10
+$CLI promote rel-orphan --request-id judge    # 失败率 0.10 >= 0.05 -> 自动回滚
+
+# 5) 历史结论各一条，快照记录当初绑定的版本号与缺省参数
+$CLI history
+
+# 6) 再开一次（模拟重启）：终态与历史不变，也不会多写
+$CLI status rel-orphan          # status=rolled_back
+$CLI history | python3 -c 'import sys,json;print("history entries:",len(json.load(sys.stdin)["history"]))'
+
+rm -rf "$D"
+```
+
+预期：第 2 步 `status` 正常输出而不是报错退出；第 3 步 `to_status=completed`；
+第 4 步 `rolled_back=true`；第 6 步 `history entries: 2` 且重复打开不会增减。
 

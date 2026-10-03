@@ -17,6 +17,12 @@ same stored record re-evaluated at any time yields the same conclusion:
 * steps stored as bare integers      -> ``[10, 30, ...]`` means
   ``(percent=10, observe=5), ...``
 * missing ``name`` / ``created_at``  -> ``"default"`` / ``""``
+* missing ``policy_version`` on a release record -> 1
+* release bound to a policy version that is not stored at all ->
+  :meth:`PolicyRegistry.get_or_default` falls back to a policy built from the
+  same ``DEFAULT_*`` constants (threshold 0.05, min_requests 100, steps
+  ``[10,30,50,100]`` x 5 minutes), so judging/promoting never fails just
+  because the policy definition is absent.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
     from canary.store import LocalStore
 
 # Stable defaults used when legacy records are missing fields.
+DEFAULT_POLICY_VERSION = 1
 DEFAULT_FAILURE_RATE_THRESHOLD = 0.05
 DEFAULT_MIN_REQUESTS = 100
 DEFAULT_OBSERVE_MINUTES = 5
@@ -244,6 +251,32 @@ class PolicyRegistry:
                 "policy_not_found", details={"version": version}
             )
         return PromotionPolicy.from_dict(raw)
+
+    def get_or_default(self, version: int) -> PromotionPolicy:
+        """Return policy ``version``, or a stable default if it is not stored.
+
+        Legacy state files may contain releases bound to a policy version whose
+        definition was never persisted.  Such releases must keep evaluating and
+        promoting instead of failing, so the lookup falls back to a policy
+        built purely from the module-level ``DEFAULT_*`` constants — identical
+        in every process, on every restart, for every re-evaluation.  The
+        fallback keeps the requested ``version`` so history snapshots still
+        record which version the release was originally bound to.
+        """
+        raw = self._store.get_policy(version)
+        if raw is not None:
+            return PromotionPolicy.from_dict(raw)
+        return PromotionPolicy(
+            version=int(version),
+            name=DEFAULT_POLICY_NAME,
+            steps=tuple(
+                CanaryStep(percent, DEFAULT_OBSERVE_MINUTES)
+                for percent in DEFAULT_STEPS
+            ),
+            failure_rate_threshold=DEFAULT_FAILURE_RATE_THRESHOLD,
+            min_requests=DEFAULT_MIN_REQUESTS,
+            created_at="",
+        )
 
     def latest(self) -> PromotionPolicy:
         versions = self._store.all_policies()

@@ -204,7 +204,7 @@ class CanaryEngine:
         """
         with self.store.lock():
             release = self._require_release(release_id)
-            policy = self.policies.get(release.policy_version)
+            policy = self._policy_for(release)
             return self._evaluate_locked(release, policy)
 
     def _evaluate_locked(
@@ -320,7 +320,7 @@ class CanaryEngine:
                     # Deterministic input validation first: an illegal target is
                     # rejected regardless of window state.
                     self._resolve_target_step(release, step_index)
-                policy = self.policies.get(release.policy_version)
+                policy = self._policy_for(release)
                 healthy, reason = self._evaluate_locked(release, policy)
                 if not healthy:
                     rb = self._do_rollback_locked(release, "auto", reason)
@@ -458,7 +458,7 @@ class CanaryEngine:
     # History / helpers
     # ------------------------------------------------------------------ #
     def _finalize_history(self, release: Release) -> None:
-        policy = self.policies.get(release.policy_version)
+        policy = self._policy_for(release)
         entry = HistoryEntry(
             release_id=release.release_id,
             service=release.service,
@@ -479,6 +479,22 @@ class CanaryEngine:
     def get_release(self, release_id: str) -> Release:
         with self.store.lock():
             return self._require_release(release_id)
+
+    def _policy_for(self, release: Release) -> PromotionPolicy:
+        """Resolve the policy a stored release is bound to.
+
+        Legacy state files may reference a policy version whose definition was
+        never persisted; those releases fall back to the stable default
+        parameters (see :meth:`PolicyRegistry.get_or_default`) so they keep
+        evaluating/promoting deterministically instead of failing on open.
+        """
+        raw = self.store.get_policy(release.policy_version)
+        if raw is None:
+            logger.info(
+                "policy fallback release=%s version=%s -> stable defaults",
+                release.release_id, release.policy_version,
+            )
+        return self.policies.get_or_default(release.policy_version)
 
     def _require_release(self, release_id: str) -> Release:
         release = self.store.get_release(release_id)
