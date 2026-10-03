@@ -18,7 +18,7 @@ canary/
   service.py  # 应用门面（HTTP / CLI / 测试共用同一入口）
   api.py      # FastAPI HTTP 入口（支持 CANARY_STATE_PATH 共享状态文件）
   cli.py      # 命令行入口（python -m canary.cli，独立进程操作同一状态文件）
-tests/        # 43 个单测：状态机、阈值边界、并发幂等、策略历史、HTTP、多进程、重启续跑
+tests/        # 55 个单测：状态机、阈值边界、并发幂等、策略历史、HTTP、多进程、重启续跑、旧格式兼容
 scripts/demo.py  # 本地端到端演示
 ```
 
@@ -93,10 +93,13 @@ scripts/demo.py  # 本地端到端演示
 - 事后再创建更严格 / 更宽松的新策略，**不会改写任何已结束发布的结论**；
   新发布按新策略评估。
 - **旧记录缺省语义稳定**（永远取固定常量，而非"当前值"）：
+  - 发布记录缺 `policy_version` → 绑定 `v1`（文件里无策略定义时透明补回默认 v1）；
   - 缺 `failure_rate_threshold` → `0.05`
   - 缺 `min_requests` → `100`
-  - 步长为裸整数 `[10,100]` → 每步 `observe_minutes=5`
+  - 步长为裸整数 `[10,100]` 或缺每步 `observe_minutes` → 每步 `5` 分钟
   - 缺 `steps` → `[10,30,50,100]`；缺 `name` → `"default"`
+  - 引用了**文件中未定义的策略版本** → 按固定缺省（0.05 / 100 / 自身步长时长）
+    合成内存策略继续判定，不报错、不落盘、不顶替版本号（详见 4.5 节）
 - `PromotionPolicy.from_dict(snapshot).to_dict()` 幂等且确定性：
   **相同输入 + 相同策略重复评估必得到相同结论**。
 
@@ -158,13 +161,31 @@ scripts/demo.py  # 本地端到端演示
   失败比例阈值、样本量要求、每步观察时长判定，不会被后来新建的策略影响。
 - **已结束的发布结论永不改变**：重启、换进程、重复评估都不会改写终态或历史；
   历史里的 `policy_snapshot` 保持写入时的字节级内容。
-- **旧格式文件缺字段的缺省含义保持稳定**：
+- **旧格式文件缺字段的缺省含义保持稳定**（缺省值永远是下列**固定常量**，
+  与"当前最新策略"无关，因此同一份旧记录无论重启多少次、在哪个进程、重复评估
+  多少遍，判定参数完全一致）：
+  - 发布记录缺 `policy_version` → 按 **v1** 绑定；加载该记录不再报错，
+    **同文件里的其他记录不受牵连**；
+  - 发布记录缺 `steps` → 步长 `[10,30,50,100]`；步长缺 `observe_minutes`
+    或步长直接写成裸整数 `[10,100]` → 每步观察时长 **5 分钟**；
+  - 策略快照缺 `failure_rate_threshold` → **0.05**；缺 `min_requests` → **100**；
+    缺 `steps` → `[10,30,50,100]`；缺 `name` → `"default"`；
   - 老文件没有 `policies` 段时，打开即透明补回默认策略 v1（固定默认
     阈值 0.05 / 样本 100 / 步长 `[10,30,50,100]` / 每步 5 分钟），
     引用 v1 的老发布可直接继续；
-  - 步长缺 `observe_minutes` → 5；发布/历史记录缺
+  - 发布/历史记录缺
     `created_at` / `updated_at` / `finish_reason` / `reason` /
     `policy_snapshot` / `finished_at` → 空字符串或空对象，语义与第 3 节一致。
+- **引用了"文件里没有定义的策略版本"的老发布**（例如老版本用一份非默认策略登记，
+  但状态文件里没留下该策略定义）：打开文件不会失败，判定/推进时**透明套用固定
+  缺省语义**继续往下走——失败比例阈值 0.05、样本量 100、每步观察时长取该发布
+  自身步长里存的值（步长也缺失时为 5 分钟）。
+  - 合成的缺省策略**只在内存中按需生成、不写回状态文件**，`policies` 段原样保留；
+    发布结束时历史快照仍写它原来绑定的版本号与本次生效的缺省参数；
+  - 被幽灵引用的版本号视为"已占用"：此后新建策略的版本号会越过它
+    （高水位 `max(已定义版本, 被引用版本) + 1`），新策略永远不会顶替老发布
+    正在使用的版本号；
+  - 已结束的老发布只做读取/重放，结论与历史台账既不改写也不追加。
 - 兼容范围说明：状态文件面向**同一台机器、可信本地进程**之间共享（Unix `flock`，
   Linux/macOS 可用）；不面向网络文件系统上的多机协作。不给 `persist_path` 时
   退化为纯内存模式（单进程，不落盘）。
@@ -219,12 +240,16 @@ uv run uvicorn main:app --reload
 # 安装依赖
 uv sync --group dev
 
-# 全量单测（43 个）：除原有场景外，新增真正起独立 OS 进程的多进程共享、
-# 跨进程并发推进/回滚、跨重启续跑（含自定义策略）、终态不可变、旧格式缺省、
-# 原子落盘与进程被杀等用例
+# 全量单测（55 个）：除原有场景外，新增真正起独立 OS 进程的多进程共享、
+# 跨进程并发推进/回滚、跨重启续跑（含自定义策略）、终态不可变、旧格式缺省
+# （缺字段 / 引用未定义策略 / 反复重启重复评估）、原子落盘与进程被杀等用例
 uv run pytest -s          # -s 可看到输入、状态迁移与判定依据日志
 uv run pytest             # 简洁模式
-uv run pytest tests/test_multiprocess.py tests/test_restart.py  # 只跑新场景
+uv run pytest tests/test_multiprocess.py tests/test_restart.py  # 多进程 + 重启
+uv run pytest tests/test_legacy_compat.py -v                    # 只跑旧格式兼容
+
+# 旧格式兼容场景的自动化覆盖（11 个），日志按业务分组打印 CASE 行
+uv run pytest tests/test_legacy_compat.py -s
 
 # 端到端演示（走真实 HTTP 调用，含健康完成 + 边界自动回滚 + 幂等 + 历史）
 uv run python scripts/demo.py
@@ -296,4 +321,81 @@ rm -rf "$D"
 预期：`list-policies` 能看到 v1+v2；重启后的 `evaluate` 仍按 **3 分钟 / 250 样本 /
 阈值 0.30** 判定；`after-restart` 推进到 60%，其重放结论不变；16 个并发回滚后
 `history entries: 1`。
+
+### 一键验证旧格式文件兼容（缺字段 + 幽灵策略，无需任何前置设置）
+
+整段复制到终端即可：它会在临时目录里手写一份"老版本风格"的状态文件——里面一条
+发布**完全没有 `policy_version` 字段**、步长是裸整数；另一条发布绑着一个
+**文件里根本没有定义的策略版本 v6**——然后用一个个全新 CLI 进程打开并推进它。
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+D=$(mktemp -d); export CANARY_STATE_PATH="$D/legacy.json"
+CLI="uv run python -m canary.cli --state $CANARY_STATE_PATH"
+cat > "$CANARY_STATE_PATH" <<'JSON'
+{
+  "releases": [
+    {"release_id": "rel-anon", "service": "pay", "environment": "prod",
+     "old_version": "v1", "new_version": "v2", "status": "pending",
+     "steps": [10, 30, 100], "current_step_index": -1},
+    {"release_id": "rel-ghost", "service": "risk", "environment": "prod",
+     "old_version": "v1", "new_version": "v2", "status": "canary",
+     "policy_version": 6,
+     "steps": [{"new_version_percent": 25, "observe_minutes": 4},
+               {"new_version_percent": 100, "observe_minutes": 4}],
+     "current_step_index": 0}
+  ],
+  "decisions": [],
+  "history": [],
+  "policies": []
+}
+JSON
+
+# 1) 缺 policy_version 的老记录按 v1 加载，裸整数步长补每步 5 分钟；进程不退出
+$CLI status rel-anon
+# 2) 同文件里另一条记录照常可用（一条老记录不顶崩整个入口）
+$CLI status rel-ghost
+# 3) 幽灵策略 v6 不再 policy_not_found：填满 4 分钟窗口 / 共 100 样本后健康判定
+for m in 0 1 2 3; do
+  $CLI observe rel-ghost --step 0 --minute $m --total 25 --failed 0
+done
+$CLI evaluate rel-ghost
+# 4) 反复"重启"重复判定：新开 3 个进程评估同一个未满窗口，缺省参数完全一致
+for i in 1 2 3; do
+  $CLI evaluate rel-ghost 2>/dev/null || true
+done
+#    （窗口已满，这里应三次都 healthy=true；下面演示未满窗口时三次都得到同一个
+#      observation_pending：进入第二步前先只报 2 分钟、共 90 样本）
+$CLI promote rel-ghost --request-id to-step1 >/dev/null
+for m in 0 1; do
+  $CLI observe rel-ghost --step 1 --minute $m --total 45 --failed 0 >/dev/null
+done
+for i in 1 2 3; do
+  $CLI evaluate rel-ghost 2>/dev/null || true
+done
+#    每次都是 observation_pending（退出码 1），details 固定为
+#    required_minutes=4、min_requests=100、observed_minutes=2、total_requests=90
+# 5) 合成的缺省策略不写盘：policies 段仍只有透明补回的默认 v1
+python3 -c 'import json,os;p=json.load(open(os.environ["CANARY_STATE_PATH"]));print("policies on disk:",[x["version"] for x in p["policies"]])'
+# 6) 新建策略越过被幽灵引用的 v6（高水位分配），不会顶替老发布的版本号
+$CLI create-policy --name newer --steps 10,100 --threshold 0.01 | \
+  python3 -c 'import sys,json;print("new policy version:",json.load(sys.stdin)["version"])'
+# 7) 反复"重启"（每条命令都是新进程）推进缺字段老记录，结论稳定、历史只一条
+$CLI promote rel-anon --request-id enter
+for m in 0 1 2 3 4; do
+  $CLI observe rel-anon --step 0 --minute $m --total 100 --failed 0
+done
+$CLI promote rel-anon --request-id p0
+$CLI rollback rel-anon --request-id rb1
+$CLI rollback rel-anon --request-id rb1     # 幂等重放：同一结论，不重复写历史
+$CLI history | python3 -c 'import sys,json;print("history entries:",len(json.load(sys.stdin)["history"]))'
+
+rm -rf "$D"
+```
+
+预期：步骤 1 的 `policy_version` 显示 `1`、步长观察时长全为 `5`；步骤 3
+`healthy=true`，判定依据为 `threshold=0.05`（幽灵 v6 按固定缺省）、窗口要求
+`4` 分钟（发布自身步长）；步骤 5 打印 `policies on disk: [1]`；步骤 6 新建出的是
+**v7** 而不是 v6；步骤 7 最终 `history entries: 1`。
+
 

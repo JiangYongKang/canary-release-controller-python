@@ -83,7 +83,10 @@ class CanaryEngine:
         if old_version == new_version:
             raise InvalidArgumentError(
                 "invalid_argument",
-                details={"field": "new_version", "problem": "must differ from old_version"},
+                details={
+                    "field": "new_version",
+                    "problem": "must differ from old_version",
+                },
             )
         with self.store.lock():
             existing = self.store.find_release(service, environment)
@@ -122,7 +125,8 @@ class CanaryEngine:
                 },
             )
             logger.info(
-                "transition %s: <none> -> %s", release.release_id,
+                "transition %s: <none> -> %s",
+                release.release_id,
                 ReleaseStatus.PENDING.value,
             )
             return release
@@ -155,7 +159,10 @@ class CanaryEngine:
             if not (0 <= step_index < len(release.steps)):
                 raise InvalidArgumentError(
                     "invalid_argument",
-                    details={"field": "step_index", "valid": f"0..{len(release.steps)-1}"},
+                    details={
+                        "field": "step_index",
+                        "valid": f"0..{len(release.steps) - 1}",
+                    },
                 )
             if step_index > release.current_step_index:
                 raise IllegalStateError(
@@ -204,7 +211,7 @@ class CanaryEngine:
         """
         with self.store.lock():
             release = self._require_release(release_id)
-            policy = self.policies.get(release.policy_version)
+            policy = self.policies.resolve_for_release(release)
             return self._evaluate_locked(release, policy)
 
     def _evaluate_locked(
@@ -266,7 +273,9 @@ class CanaryEngine:
             f"fail_rate={fail_rate:.6f} threshold={policy.failure_rate_threshold}"
             f" (failed={failed}, total={total}); rule: fail_rate >= threshold -> rollback"
         )
-        logger.info("judgement=%s reason=%s", "healthy" if healthy else "unhealthy", reason)
+        logger.info(
+            "judgement=%s reason=%s", "healthy" if healthy else "unhealthy", reason
+        )
         return healthy, reason
 
     # ------------------------------------------------------------------ #
@@ -320,7 +329,7 @@ class CanaryEngine:
                     # Deterministic input validation first: an illegal target is
                     # rejected regardless of window state.
                     self._resolve_target_step(release, step_index)
-                policy = self.policies.get(release.policy_version)
+                policy = self.policies.resolve_for_release(release)
                 healthy, reason = self._evaluate_locked(release, policy)
                 if not healthy:
                     rb = self._do_rollback_locked(release, "auto", reason)
@@ -337,7 +346,9 @@ class CanaryEngine:
                     self._remember(request_id, "promote", result)
                     logger.info(
                         "transition %s: %s -> %s (auto rollback during promote)",
-                        release.release_id, from_status.value, rb.to_status.value,
+                        release.release_id,
+                        from_status.value,
+                        rb.to_status.value,
                     )
                     return result
                 if at_last:
@@ -382,7 +393,11 @@ class CanaryEngine:
             self._remember(request_id, "promote", result)
             logger.info(
                 "transition %s: %s -> %s step=%s percent=%s",
-                release.release_id, from_status.value, to_status.value, target, percent,
+                release.release_id,
+                from_status.value,
+                to_status.value,
+                target,
+                percent,
             )
             return result
 
@@ -432,7 +447,9 @@ class CanaryEngine:
             self._remember(request_id, "rollback", result)
             logger.info(
                 "transition %s: %s -> rolled_back trigger=%s",
-                release.release_id, from_status.value, reason,
+                release.release_id,
+                from_status.value,
+                reason,
             )
             return result
 
@@ -458,7 +475,7 @@ class CanaryEngine:
     # History / helpers
     # ------------------------------------------------------------------ #
     def _finalize_history(self, release: Release) -> None:
-        policy = self.policies.get(release.policy_version)
+        policy = self.policies.resolve_for_release(release)
         entry = HistoryEntry(
             release_id=release.release_id,
             service=release.service,
@@ -473,7 +490,8 @@ class CanaryEngine:
         self.store.append_history(entry)
         logger.info(
             "history finalized release=%s conclusion=%s",
-            release.release_id, release.status.value,
+            release.release_id,
+            release.status.value,
         )
 
     def get_release(self, release_id: str) -> Release:

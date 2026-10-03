@@ -41,6 +41,7 @@ from canary.models import (
     Release,
     ReleaseStatus,
 )
+from canary.policy import DEFAULT_POLICY_VERSION, coerce_step
 
 
 class _Transaction:
@@ -156,9 +157,7 @@ class LocalStore:
                     release.release_id
                 )
             else:
-                self._active_index.pop(
-                    (release.service, release.environment), None
-                )
+                self._active_index.pop((release.service, release.environment), None)
             self._mark_dirty()
 
     def get_release(self, release_id: str) -> Release | None:
@@ -178,9 +177,7 @@ class LocalStore:
         with self.lock():
             return self._decisions.get((release_id, request_id))
 
-    def remember_decision(
-        self, release_id: str, request_id: str, outcome: str
-    ) -> None:
+    def remember_decision(self, release_id: str, request_id: str, outcome: str) -> None:
         if not request_id:
             return
         with self.lock():
@@ -213,6 +210,15 @@ class LocalStore:
     def all_policies(self) -> list[dict]:
         with self.lock():
             return [dict(self._policies[v]) for v in sorted(self._policies)]
+
+    def referenced_policy_versions(self) -> set[int]:
+        """Policy versions bound by any stored release (defined or not).
+
+        Includes "ghost" references from legacy files where a release was
+        registered against a policy whose definition was never persisted.
+        """
+        with self.lock():
+            return {r.policy_version for r in self._releases.values()}
 
     # ---- (de)serialization --------------------------------------------
     def _reset_blank(self) -> None:
@@ -275,9 +281,7 @@ class LocalStore:
         for d in payload.get("decisions", []):
             decisions[(d["release_id"], d["request_id"])] = d["outcome"]
         history = [_history_from_dict(h) for h in payload.get("history", [])]
-        policies = {
-            int(p["version"]): dict(p) for p in payload.get("policies", [])
-        }
+        policies = {int(p["version"]): dict(p) for p in payload.get("policies", [])}
         self._reset_blank()
         self._releases = releases
         self._active_index = active_index
@@ -328,8 +332,19 @@ def _release_to_dict(r: Release) -> dict:
 
 
 def _release_from_dict(raw: dict) -> Release:
-    from canary.models import CanaryStep
+    # Legacy writers could omit policy_version / steps entirely.  Fill both
+    # with the *fixed* defaults (never "current" policy values) so one sparse
+    # old record loads instead of aborting the whole file and poisoning every
+    # other good record in it.
+    policy_version = raw.get("policy_version", DEFAULT_POLICY_VERSION)
+    raw_steps = raw.get("steps")
+    if raw_steps is None:
+        from canary.policy import DEFAULT_STEPS
 
+        raw_steps = list(DEFAULT_STEPS)
+    # Accept new-style mappings, legacy mappings without observe_minutes and
+    # legacy bare-int percents with one shared coercion.
+    steps = [coerce_step(s) for s in raw_steps]
     return Release(
         release_id=raw["release_id"],
         service=raw["service"],
@@ -337,14 +352,8 @@ def _release_from_dict(raw: dict) -> Release:
         old_version=raw["old_version"],
         new_version=raw["new_version"],
         status=ReleaseStatus(raw["status"]),
-        policy_version=raw["policy_version"],
-        steps=[
-            CanaryStep(
-                new_version_percent=s["new_version_percent"],
-                observe_minutes=s.get("observe_minutes", 5),
-            )
-            for s in raw["steps"]
-        ],
+        policy_version=int(policy_version),
+        steps=steps,
         current_step_index=raw["current_step_index"],
         created_at=raw.get("created_at", ""),
         updated_at=raw.get("updated_at", ""),
